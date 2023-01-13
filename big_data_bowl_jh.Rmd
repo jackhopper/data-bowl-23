@@ -1,0 +1,304 @@
+---
+title: "Big Data Bowl 23"
+author: "Jack Hopper"
+date: "2023-01-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Big Data Bowl 2023
+
+For the 2023 Big Data Bowl, I decided to look at pre-snap data to determine a baseline model for predicting whether a lineman will be beat by a defender on the play. While there is a very rich set of quantitative & eye-test data that could supplement the analysis, I am curious: can we guess if a lineman will have a negative outcome based only on what we see pre-snap?
+
+To start, we will load in the provided data.
+
+```{r load_data}
+library(tidyverse)
+
+games <- read_csv("games.csv")
+pffScoutingData <- read_csv("pffScoutingData.csv")
+players <- read_csv("players.csv")
+plays <- read_csv("plays.csv")
+week1 <- read_csv("week1.csv")
+week2 <- read_csv("week2.csv")
+week3 <- read_csv("week3.csv")
+week4 <- read_csv("week4.csv")
+week5 <- read_csv("week5.csv")
+week6 <- read_csv("week6.csv")
+week7 <- read_csv("week7.csv")
+week8 <- read_csv("week8.csv")
+
+all_weeks <- bind_rows(week1, week2, week3, week4, week5, week6, week7, week8)
+
+##Create unique ID for events -- combination of game & play
+all_weeks$eventId <- paste0(all_weeks$gameId, all_weeks$playId)
+```
+
+## Create baseline dataset on linemen movement
+
+
+```{r pressure}
+linemen_events <- all_weeks %>% 
+  left_join(y = players, by = "nflId") %>% 
+  filter(officialPosition == "C" | officialPosition == "G" | officialPosition == "T") %>% 
+  select(-collegeName)
+
+glimpse(linemen_events)
+```
+
+This dataset gives us a lot of information on the specific movements of a player. But let's see if we can supplement this with player statistics.
+
+First let's examine the players dataset
+
+```{r players}
+glimpse(players)
+
+players %>% 
+  filter(is.na(birthDate)) #%>% 
+```
+It looks like there are some players with missing birthdays in the players dataset. This is important because we will attempt to attach player age to our linemen table later. It looks like these missing players are mostly rookies. So, let's infer their birthdate: I'll assign them all 1/1/1998 for now, then look at linemen only and create a table for all players to join when they are the 'defender' being blocked by the lineman.
+
+```{r impute_players}
+players <- players %>% 
+  mutate(birthDate = ifelse(is.na(birthDate), "1998-01-01", birthDate))
+
+linemen <- players %>% 
+  filter(officialPosition == "C" | officialPosition == "G" | officialPosition == "T")
+
+opposition <- players %>% 
+  mutate(opposing_weight = weight,
+         opposing_height = height,
+         opposing_position = officialPosition)
+```
+
+Now we can look at the PFF data, which includes information on whether a player was 'beaten' by their defender on the play.
+```{r pff}
+linemen_scouting <- pffScoutingData %>% 
+  mutate(eventId = paste0(pffScoutingData$gameId, pffScoutingData$playId)) %>% 
+  filter(nflId %in% linemen$nflId)
+```
+
+And we can supplement this data with other information about each player, as below.
+```{r more_player_data}
+###Add player stats to scouting data
+#First basic stats
+linemen_scouting <- linemen_scouting %>% 
+  left_join(select(players, nflId, weight, height), by = "nflId")
+#Then player age
+player_age <- all_weeks %>% 
+  left_join(y = players, by = "nflId") %>% 
+  select(-collegeName) %>% 
+  mutate(player_age = as.numeric(as.Date(time) - as.Date(birthDate))/365.25) %>% 
+  select(eventId, nflId, player_age) %>% 
+  group_by(eventId, nflId) %>% 
+  summarise(player_age = mean(player_age)) %>%
+  ungroup()
+#We can simplify this dataset, as player age won't vary dramatically week to week
+player_age <- player_age %>% 
+  group_by(nflId) %>% 
+  summarize(player_age = mean(player_age))
+
+#And finish it off...
+linemen_scouting <- linemen_scouting %>% 
+  inner_join(player_age, by = c("nflId"))
+
+#Remove extraneous columns (fields for defensive players)
+linemen_scouting <- linemen_scouting %>% 
+  select(-pff_hit, -pff_hurry, -pff_sack)
+
+#Remove miscellaneous positions
+linemen_scouting <- linemen_scouting %>% 
+  filter(pff_positionLinedUp %in% c("C", "LG", "RG", "RT", "LT"))
+```
+
+Let's visualize our data!
+
+```{r explore}
+##### EDA on linemen data
+#Exploring how often a player allows an event to happen
+linemen_scouting %>% 
+  group_by(nflId) %>% 
+  summarize(obs = n(),
+            pff_beatenByDefender = mean(pff_beatenByDefender),
+            pff_hitAllowed = mean(pff_hitAllowed),
+            pff_hurryAllowed = mean(pff_hurryAllowed),
+            player_age = mean(player_age)) %>% 
+  filter(obs >= 40) %>% #Limit data to those with 'enough' observations
+  select(-obs) %>% 
+  mutate(nflId = as.character(nflId)) %>% 
+  pivot_longer(-nflId, names_to = "metric", values_to = "pct") %>% 
+  group_by(metric) %>% 
+  arrange(pct) %>% 
+  ggplot(aes(x = reorder(nflId, -pct), y = pct)) +
+  geom_col() +
+  facet_wrap(~metric, scales = 'free') +
+  theme_minimal()
+
+##Histogram for player age
+linemen_scouting %>% 
+  select(nflId, player_age) %>% 
+  mutate(nflId = as.character(nflId)) %>% 
+  pivot_longer(-nflId, names_to = "metric", values_to = "obs") %>% 
+  ggplot(aes(x = obs)) +
+  geom_histogram(binwidth = 1) +
+  facet_wrap(~metric, scales = 'free') +
+  theme_minimal()
+
+
+#Count of block type
+ggplot(linemen_scouting, aes(x = pff_blockType)) +
+  geom_bar() +
+  theme_minimal()
+
+#Explore player roles
+linemen_scouting %>% 
+  group_by(pff_positionLinedUp) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+```
+
+Now that we have a sense of our data, we can start adding additional features and coming up with a model-ready dataset.
+```{r events}
+events <- linemen_scouting
+
+events <- events %>% 
+  left_join(select(opposition, nflId, opposing_weight, opposing_height, opposing_position), by = c("pff_nflIdBlockedPlayer" = "nflId"))
+
+#Then age
+events <- events %>% 
+  left_join(player_age, by = c("pff_nflIdBlockedPlayer" = "nflId")) %>% 
+  rename(player_age = player_age.x,
+         opposition_age = player_age.y)
+
+#Remove unnecessary columns
+events %>% 
+  select(-pff_role, -pff_backFieldBlock)
+```
+
+One interesting thing we could add as a feature would be a way to measure the number of nearby defenders. Let's see if we can do that.
+
+```{r nearby}
+###Step 1: Isolate play data for snaps for defensive players & linemen positions
+
+defensive_snaps <- all_weeks %>% 
+  filter(event == 'ball_snap') %>% 
+  left_join(players, by = "nflId") %>% 
+  select(-collegeName, -displayName, -jerseyNumber, -playDirection, -birthDate) %>% 
+  filter(officialPosition %in% c("DE", "MLB", "CB", "SS", "OLB", "DT", "ILB", "NT", "FS", "LB", "DB")) %>% 
+  mutate(defensive_x = x,
+         defensive_y = y) %>% 
+  select(gameId, playId, nflId, defensive_x, defensive_y)
+
+linemen_snaps <- all_weeks %>% 
+  filter(event == 'ball_snap') %>% 
+  left_join(players, by = "nflId") %>% 
+  select(-collegeName, -displayName, -jerseyNumber, -playDirection, -birthDate) %>% 
+  filter(officialPosition %in% c("C", "G", "T")) %>% 
+  mutate(offensive_x = x,
+         offensive_y = y) %>% 
+  select(gameId, playId, nflId, offensive_x, offensive_y)
+
+
+###Step 2: Join defense & offense snaps to see where each defender is for each lineman
+snaps <- linemen_snaps %>% 
+  left_join(defensive_snaps, by = c("gameId" = "gameId", "playId" = "playId"))
+
+###Step 3: Flag each entry as meeting or not meeting the threshold for x & y distance
+#Define the thresholds
+x_threshold <- 2
+y_threshold <- 1.5
+
+#Do the flagging
+snaps <- snaps %>% 
+  mutate(near_x = if_else(abs(offensive_x - defensive_x) <= x_threshold, 1, 0),
+         near_y = if_else(abs(offensive_y - defensive_y) <= y_threshold, 1, 0),
+         nearby_defender = if_else(near_x == 1 & near_y == 1, 1, 0))
+
+###Step 4: Count up the number of nearby defenders for each lineman per play
+#First - validate that the thresholds we set show reasonable results
+snaps %>% 
+  group_by(gameId, playId, nflId.x) %>% 
+  summarize(across(c(nearby_defender, near_x, near_y), sum)) %>% 
+  ggplot() +
+    geom_bar(aes(x = nearby_defender)) +
+    theme_minimal()
+
+#Then apply the math to the df
+snaps <- snaps %>% 
+  group_by(gameId, playId, nflId.x) %>% 
+  summarize(across(c(nearby_defender), sum))
+
+###Step 5: Re-join to the main events table
+events <- events %>% 
+  left_join(snaps, by = c("nflId" = "nflId.x", "gameId" = "gameId", "playId" = "playId"))
+
+### Add info on the play itself
+#First define what we want to append to the events df
+plays_slim <- plays %>% 
+  mutate(eventId = paste0(gameId, playId)) %>% 
+  select(eventId, quarter, down, yardsToGo, possessionTeam, yardlineSide, yardlineNumber,
+         offenseFormation, defendersInBox, pff_passCoverage) %>% 
+  mutate(yards_from_endzone = case_when(possessionTeam == yardlineSide ~ (50-yardlineNumber) + 50,
+                                   TRUE ~ yardlineNumber))
+
+#Then add it
+events <- events %>% 
+  left_join(plays_slim, by = "eventId")
+```
+
+Now we can come up with our outcome variable: if a lineman is beaten by a defender in any way -- 'beaten', 'hurry allowed,' 'hit allowed,' or 'sack allowed,' we'll consider them all to be the same bad outcome. If a lineman didn't allow a hit, he will get a score of 0. So not getting beat = 0, getting beat = 1.
+```{r mrd}
+events <- events %>% 
+  mutate(event_score = case_when(pff_beatenByDefender == 1 ~ 1,
+                                 pff_hurryAllowed == 1 ~ 1,
+                                 pff_hitAllowed == 1 ~ 1,
+                                 pff_sackAllowed == 1 ~ 1,
+                                 TRUE ~ 0)) %>% 
+  select(-pff_beatenByDefender, -pff_hurryAllowed, -pff_hitAllowed, -pff_sackAllowed)
+```
+
+Now we can create a model-ready dataset and ensure we aren't missing data.
+```{r mrd}
+mrd <- events %>% 
+  select(eventId, everything(), -gameId, -playId, -pff_role)
+
+#install.packages("Amelia")
+library(Amelia)
+missmap(mrd, main = "Missingness Map")
+
+#We should remove cases where opposing_position is missing
+mrd <- mrd %>% 
+  filter(!is.na(opposing_position))
+
+#Remove non-predictor/predicted columns
+mrd <- mrd %>% 
+  select(-eventId, -nflId, -possessionTeam, -yardlineSide)
+
+#Convert height fields to numeric
+mrd <- mrd %>% 
+  separate(height, into = c("height_ft", "height_in"), sep = "-") %>% 
+  mutate_at(vars(height_ft, height_in), as.numeric) %>% 
+  mutate(height = 12*height_ft + height_in) %>% 
+  #Now move on top opposing players
+  separate(opposing_height, into = c("opposing_height_ft", "opposing_height_in"), sep = "-") %>% 
+  mutate_at(vars(opposing_height_ft, opposing_height_in), as.numeric) %>% 
+  mutate(opposing_height = 12*opposing_height_ft + opposing_height_in) %>% 
+  select(-height_ft, -height_in, -opposing_height_ft, -opposing_height_in)
+
+#Convert character fields to factor
+mrd <- mrd %>% 
+  mutate_at(vars(pff_positionLinedUp, pff_blockType, opposing_position, 
+                 quarter, down, offenseFormation, pff_passCoverage, event_score), as.factor)
+
+#One more missingness map
+missmap(mrd, main = "Missingness Map")
+```
+That was a lot of pre-processing: let's take one final look at our dataset before modeling it.
+```{r str}
+str(mrd)
+```
+
