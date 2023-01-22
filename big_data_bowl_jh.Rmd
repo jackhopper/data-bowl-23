@@ -11,11 +11,11 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Big Data Bowl 2023
 
-For the 2023 Big Data Bowl, I decided to look at pre-snap data to determine a baseline model for predicting whether a lineman will be beat by a defender on the play. While there is a very rich set of quantitative & eye-test data that could supplement the analysis, I am curious: can we guess if a lineman will have a negative outcome based only on what we see pre-snap?
+For the 2023 Big Data Bowl, I decided to look at pre-snap data to determine a baseline model for predicting whether a lineman will be beat by a defender on the play. While there is a very rich set of quantitative & eye-test data that could supplement the analysis, I am curious: can we guess if a lineman will have a negative outcome based only on what we see pre-snap? In other words, I'm going to do a baseline analysis that includes only the basic descriptions about a lineman and his opponent -- height, weight, as well as some info about the play type (ie offensive formation, which down it is, and basic pass coverage) -- and see how 'accurately' we can predict whether or not the lineman will successfully block his defender or not.
 
 To start, we will load in the provided data.
 
-```{r load_data}
+```{r load_data, warning=FALSE, message=FALSE}
 library(tidyverse)
 
 games <- read_csv("games.csv")
@@ -37,7 +37,7 @@ all_weeks <- bind_rows(week1, week2, week3, week4, week5, week6, week7, week8)
 all_weeks$eventId <- paste0(all_weeks$gameId, all_weeks$playId)
 ```
 
-## Create baseline dataset on linemen movement
+#### Create baseline dataset on linemen movement
 
 
 ```{r pressure}
@@ -114,7 +114,7 @@ linemen_scouting <- linemen_scouting %>%
   filter(pff_positionLinedUp %in% c("C", "LG", "RG", "RT", "LT"))
 ```
 
-Let's visualize our data!
+Let's visualize our data.
 
 ```{r explore}
 ##### EDA on linemen data
@@ -160,6 +160,7 @@ linemen_scouting %>%
   arrange(desc(n))
 
 ```
+#### Adding features about the defense
 
 Now that we have a sense of our data, we can start adding additional features and coming up with a model-ready dataset.
 ```{r events}
@@ -249,6 +250,7 @@ plays_slim <- plays %>%
 events <- events %>% 
   left_join(plays_slim, by = "eventId")
 ```
+#### Determining the outcome variable
 
 Now we can come up with our outcome variable: if a lineman is beaten by a defender in any way -- 'beaten', 'hurry allowed,' 'hit allowed,' or 'sack allowed,' we'll consider them all to be the same bad outcome. If a lineman didn't allow a hit, he will get a score of 0. So not getting beat = 0, getting beat = 1.
 ```{r mrd}
@@ -302,3 +304,86 @@ That was a lot of pre-processing: let's take one final look at our dataset befor
 str(mrd)
 ```
 
+### Part II: Modeling
+Throughout my analysis I tried looking at both a simple decision tree and a more complex random forest methodology. Since the random forest does better, I will describe this process below. The goal of this analysis is to see 'how far' simple pre-snap statistics can take us when it comes to predicting whether or not a lineman will give up a pressure or sack on a given pass play. I don't expect he model to be extremelye accurate because this dataset does not take into account 'eye test' metrics such as protection moves used, type of pass play called, historical performance of players, etc.
+
+#### Setting up the Model
+First, we have to separate our data into a training & test set.
+
+```{r train_test}
+library(caret)
+library(performanceEstimation) #For SMOTE
+
+RNGkind(sample.kind = "Rounding")
+set.seed(1234)
+sample_set <- createDataPartition(y = mrd$event_score, p = .75, list = FALSE)
+outcome_train <- mrd[sample_set, ]
+outcome_test <- mrd[-sample_set, ]
+
+colnames(outcome_train) <- make.names(colnames(outcome_train))
+```
+One thing we need to look for is whether or not the two classes in our outcome variable are represented equally; otherwise, the model won't be able to figure out how to predict the minority class. Let's examine this below.
+```{r smote}
+#Are classes even?
+round(prop.table(table(outcome_train$event_score)),2)
+```
+We can see the two classes are not close to equal -- only 11% of the training data is of type 1 (ie bad outcome). To correct for this, we can make synthetic training data using the 'SMOTE' (synthetic minority oversampling technique) method.
+
+```{r smote_two}
+#Need to make synthetic data to even up the classes
+outcome_train <- smote(event_score ~ ., data.frame(outcome_train), perc.over = 2, k = 5, perc.under = 2)
+round(prop.table(table(outcome_train$event_score)),2) #Now, the data is balanced, moreso
+```
+#### Model Building & Testing
+
+While it isn't perfect, the classes are much more closely matched now. We can proceed with model-building.
+```{r rf_setup}
+library(randomForest)
+
+modelLookup("rf")
+#There is only one hyperparameter - mtry (the max # of features sampled within a tree)
+grid <- expand.grid(mtry = seq(from = 4, to = 10, by = 1))
+```
+Random forest takes one hyperparameter, called 'mtry,' and we can iterate through the value of this with a grid search. Now we can build the model. Note that I am picking the best model based on kappa rather than pure accuracy, which tracks accuracy after correcting for the likelihood of picking the right model at random -- a necessary adjustment given the lower naturally-occurring instances of the minority class here.
+```{r rf_modeling}
+#Train the model
+RNGkind(sample.kind = "Rounding")
+set.seed(1234)
+
+rf_mod <- train(
+  event_score ~ .,
+  data = outcome_train,
+  method = "rf",
+  na.action = na.omit,
+  metric = "Kappa",
+  trControl = trainControl(method = "boot632", number = 3),
+  tuneGrid = grid
+)
+
+rf_mod
+```
+#### Evaluating performance
+
+And we can evaluate performance on the test set.
+```{r rf_eval}
+outcome_pred <- predict(rf_mod, outcome_test, type = "raw")
+head(outcome_pred)
+
+outcome_pred_table <- table(outcome_test[complete.cases(outcome_test), ]$event_score, outcome_pred)
+
+print(sum(diag(outcome_pred_table)) / nrow(outcome_test))
+```
+This analysis shows that our model is 86% accurate in our test set. For a final check, we can look at the confusion matrix to show false positives or negatives.
+
+```{r confusion}
+outcome_pred_table
+```
+Using this we can see that the model is still missing a lot of instances where the player was beat, as the model was not able to guess accurately. Still, in 86% of cases the model was able to accurately predict the outcome of the matchup. In addition, the model is catching a few cases where a lineman got beat.
+
+## Conclusion
+
+Overall, the model isn't quite good enough to be able to be used at scale... but it does at least illustrate that you can get a basic sense of the likelihood of success or failure for a lineman on a given play.
+
+Some good next steps for this analysis would be to do any of the following: supplement the analysis with more descriptive features to lead to more predictive accuracy, particularly for the '1' outcome (minority class); continue the analysis by interpreting which features are most important in our model; and use the model to analyze a specific player & situation of interest.
+
+Thanks for reading!
