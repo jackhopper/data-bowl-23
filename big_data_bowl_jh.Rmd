@@ -253,7 +253,7 @@ events <- events %>%
 #### Determining the outcome variable
 
 Now we can come up with our outcome variable: if a lineman is beaten by a defender in any way -- 'beaten', 'hurry allowed,' 'hit allowed,' or 'sack allowed,' we'll consider them all to be the same bad outcome. If a lineman didn't allow a hit, he will get a score of 0. So not getting beat = 0, getting beat = 1.
-```{r mrd}
+```{r mrd_one}
 events <- events %>% 
   mutate(event_score = case_when(pff_beatenByDefender == 1 ~ 1,
                                  pff_hurryAllowed == 1 ~ 1,
@@ -264,7 +264,7 @@ events <- events %>%
 ```
 
 Now we can create a model-ready dataset and ensure we aren't missing data.
-```{r mrd}
+```{r mrd_two}
 mrd <- events %>% 
   select(eventId, everything(), -gameId, -playId, -pff_role)
 
